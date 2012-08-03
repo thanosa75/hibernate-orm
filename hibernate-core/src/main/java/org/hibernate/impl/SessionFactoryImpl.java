@@ -29,6 +29,8 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.ObjectStreamException;
 import java.io.Serializable;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,6 +47,10 @@ import javax.naming.NamingException;
 import javax.naming.Reference;
 import javax.naming.StringRefAddr;
 import javax.transaction.TransactionManager;
+
+import net.sf.cglib.proxy.Enhancer;
+import net.sf.cglib.proxy.MethodInterceptor;
+import net.sf.cglib.proxy.MethodProxy;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -703,8 +709,84 @@ public final class SessionFactoryImpl implements SessionFactory, SessionFactoryI
 		return result;
 	}
 
+	/**
+	 * Settings is being wrapped in a thread local variable
+	 * to be able to mask changes on the global checkNullability value.
+	 */
+	private static final ThreadLocal<Settings> settingsLocalWrapper = new ThreadLocal<Settings>() ;
+	
+	/**
+	 * this proxy is for working around the fact that Settings is global
+	 * and in cases as per the issue https://hibernate.onjira.com/browse/HHH-6689
+	 * there are race conditions due to different threads playing around with the 
+	 * value of nullability.
+	 * @author t.angelatos
+	 *
+	 */
+	static class SettingsNullabilityProxy implements MethodInterceptor, Serializable {
+		/**
+		 * uid
+		 */
+		private static final long serialVersionUID = -4501169973647833554L;
+
+		private static final Logger log = LoggerFactory.getLogger(SettingsNullabilityProxy.class);
+
+		/**
+		 * set to true to mask the nullability global value
+		 */
+		boolean locallyCheckNullability = false;
+		/** 
+		 * holder for the value of nullability checks 
+		 */
+		boolean nullabilityLocalValue = false;
+		
+		Settings delegate;
+		
+		/**
+		 * return an instance of the proxy
+		 * @param obj the original Settings
+		 * @return Settings proxy
+		 */
+		public static Settings newInstance(Settings obj) {
+			Enhancer enhancer = new Enhancer();
+			enhancer.setSuperclass(obj.getClass());
+			enhancer.setCallback(new SettingsNullabilityProxy(obj));
+			return (Settings) enhancer.create();
+		}
+
+		private SettingsNullabilityProxy(Settings delegateSettings) {
+			delegate = delegateSettings;
+		}
+		
+		/**
+		 * will invoke all methods on the proxy'ed Settings except the nullability check.
+		 * If the 'setCheckNullability' is set once, from that point onwards the
+		 * thread local proxy will hold that value and never use the original Settings one.
+		 */
+		public Object intercept(Object object, Method method, Object[] args, MethodProxy methodProxy ) throws Throwable {
+			Object result;
+			
+			if (method.getName().contentEquals("setCheckNullability")) {
+				locallyCheckNullability = true;
+				nullabilityLocalValue = (Boolean) args[0];
+				log.debug("Now using threadlocal nullability check");
+				result = null;
+			} else if (method.getName().contentEquals("isCheckNullability") && locallyCheckNullability) { 
+				result = nullabilityLocalValue;
+			} else {
+				result = method.invoke(delegate, args);
+			}
+			log.debug("Called :" + method.getName() + " ==> "+result);
+			return result;
+		}
+	}	
+
+	
 	public Settings getSettings() {
-		return settings;
+		if (settingsLocalWrapper.get() == null) {
+			settingsLocalWrapper.set(SettingsNullabilityProxy.newInstance(settings));
+		}
+		return settingsLocalWrapper.get();
 	}
 
 	public Dialect getDialect() {

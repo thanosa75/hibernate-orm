@@ -45,7 +45,7 @@ import org.hibernate.tuple.entity.EntityTuplizerFactory;
  *
  * @author Gavin King
  */
-public final class Settings {
+public class Settings {
 
 //	private boolean showSql;
 //	private boolean formatSql;
